@@ -1,14 +1,23 @@
 /**
- * Terminal client for the "license-to-act" agent.
+ * Terminal client for the "changesafe" agent.
  *
  * Talks to a locally running TrueForge server (npx @truefoundry/trueforge),
- * streams the agent's turns, and -- the point of this whole project -- stops
- * and asks a human before letting the agent execute send_email,
- * create_support_ticket, or book_meeting. Nothing in the "actions" MCP
- * server runs until you type "y" here.
+ * streams the agent's turns, and -- the point of this whole project --
+ * stops and asks a human before letting the agent execute commit_change,
+ * which permanently deletes customer rows. Nothing in the "db" MCP server
+ * mutates anything until you type "y" here.
+ *
+ * Persists its session id to disk (data/session.json) and resumes it on
+ * the next run instead of always starting fresh -- demonstrating
+ * TrueForge's session persistence: kill this process mid-conversation
+ * (even mid-approval-pause) and restart it, and the agent picks up where
+ * it left off with full context intact.
  *
  * Usage: npm run cli
  */
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
 import {
   TrueForge,
@@ -18,12 +27,49 @@ import {
 } from "@truefoundry/trueforge-sdk";
 import { agentManifest } from "./agent/agentSpec.js";
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SESSION_FILE = join(__dirname, "..", "data", "session.json");
+
 const client = new TrueForge({
   baseUrl: process.env.TRUEFORGE_BASE_URL ?? "http://localhost:8790",
   timeoutInSeconds: 600,
 });
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+function loadSavedSessionId(): string | undefined {
+  if (!existsSync(SESSION_FILE)) return undefined;
+  try {
+    return (JSON.parse(readFileSync(SESSION_FILE, "utf-8")) as { sessionId?: string }).sessionId;
+  } catch {
+    return undefined;
+  }
+}
+
+function saveSessionId(sessionId: string): void {
+  const dir = dirname(SESSION_FILE);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(SESSION_FILE, JSON.stringify({ sessionId }, null, 2), "utf-8");
+}
+
+/** Reuse the last session if it still exists on the server; otherwise
+ * start a fresh one. This is what makes "kill the process, restart it"
+ * resume the same conversation instead of losing it. */
+async function getOrCreateSession(): Promise<{ id: string; resumed: boolean }> {
+  const savedId = loadSavedSessionId();
+  if (savedId) {
+    try {
+      const { data: session } = await client.sessions.get(savedId);
+      return { id: session.id, resumed: true };
+    } catch {
+      // Saved session no longer exists on the server (fresh `npx trueforge`
+      // instance, expired, etc.) -- fall through and create a new one.
+    }
+  }
+  const { data: session } = await client.sessions.create({ agent: { spec: agentManifest } });
+  saveSessionId(session.id);
+  return { id: session.id, resumed: false };
+}
 
 /** Stream one turn's events, print model text as it arrives, and return any
  * pending approval requests plus the running event index (needed to look up
@@ -95,10 +141,14 @@ async function collectApprovals(
 }
 
 async function main() {
-  const { data: session } = await client.sessions.create({ agent: { spec: agentManifest } });
-  console.log(`Session ${session.id} started. Ask "license-to-act" to do something.`);
-  console.log('Try: "Email jane@example.com to confirm tomorrow\'s 3pm sync."');
-  console.log('Type "exit" to quit.\n');
+  const { id: sessionId, resumed } = await getOrCreateSession();
+  console.log(
+    resumed
+      ? `Resumed session ${sessionId} -- picking up where you left off.`
+      : `Started session ${sessionId}.`,
+  );
+  console.log('Try: "Find any duplicate customers and tell me what merging them would affect."');
+  console.log('Type "exit" to quit (the session stays resumable next run).\n');
 
   const events = new Map<string, TrueForgeApi.TurnStreamingEvent>();
 
@@ -106,18 +156,14 @@ async function main() {
     const userText = await rl.question("> ");
     if (userText.trim().toLowerCase() === "exit") break;
 
-    let pending = await streamTurn(
-      session.id,
-      [{ type: "user.message", content: userText }],
-      events,
-    );
+    let pending = await streamTurn(sessionId, [{ type: "user.message", content: userText }], events);
 
     // An agent turn can pause for approval more than once in a row
     // (e.g. two tool calls back to back) -- keep resolving until the
     // turn actually finishes.
     while (pending.length > 0) {
       const approvals = await collectApprovals(pending, events);
-      pending = await streamTurn(session.id, approvals, events);
+      pending = await streamTurn(sessionId, approvals, events);
     }
   }
 
