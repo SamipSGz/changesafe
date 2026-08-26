@@ -4,6 +4,9 @@
   "private": true,
   "description": "An approval-gated action assistant built on TrueForge for the Agent Harness Hackathon.",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "tools:dev": "tsx watch src/tools/actions-mcp-server.ts",

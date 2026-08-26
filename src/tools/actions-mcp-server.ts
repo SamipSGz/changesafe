@@ -51,8 +51,11 @@ function buildServer(): McpServer {
     },
     async ({ to, subject, body }) => {
       const email = { id: newId("email"), to, subject, body, sentAt: new Date().toISOString() };
-      saveEmail(email);
+      // Audit first, action second: if the audit write itself fails, we
+      // throw here and the action never runs -- so an executed action can
+      // never end up missing its audit entry.
       appendAudit({ id: email.id, tool: "send_email", args: { to, subject }, result: email, timestamp: email.sentAt });
+      saveEmail(email);
       return {
         content: [{ type: "text", text: `Email sent to ${to} (id: ${email.id}).` }],
       };
@@ -79,8 +82,8 @@ function buildServer(): McpServer {
         priority,
         createdAt: new Date().toISOString(),
       };
-      saveTicket(ticket);
       appendAudit({ id: ticket.id, tool: "create_support_ticket", args: { title, priority }, result: ticket, timestamp: ticket.createdAt });
+      saveTicket(ticket);
       return {
         content: [{ type: "text", text: `Ticket ${ticket.id} created (priority: ${priority}).` }],
       };
@@ -96,7 +99,10 @@ function buildServer(): McpServer {
       inputSchema: {
         title: z.string().min(1),
         attendees: z.array(z.string().email()).min(1),
-        startTime: z.string().describe("ISO-8601 datetime"),
+        startTime: z
+          .string()
+          .refine((s) => !Number.isNaN(Date.parse(s)), "must be a valid ISO-8601 datetime")
+          .describe("ISO-8601 datetime"),
         durationMinutes: z.number().int().positive().default(30),
       },
     },
@@ -109,8 +115,8 @@ function buildServer(): McpServer {
         durationMinutes,
         createdAt: new Date().toISOString(),
       };
-      saveMeeting(meeting);
       appendAudit({ id: meeting.id, tool: "book_meeting", args: { title, attendees, startTime }, result: meeting, timestamp: meeting.createdAt });
+      saveMeeting(meeting);
       return {
         content: [{ type: "text", text: `Meeting "${title}" booked at ${startTime} with ${attendees.length} attendee(s).` }],
       };
@@ -169,8 +175,14 @@ async function handleSessionRequest(req: express.Request, res: express.Response)
 app.get("/mcp", handleSessionRequest);
 app.delete("/mcp", handleSessionRequest);
 
-app.listen(PORT, () => {
-  console.log(`[actions-mcp-server] listening on http://localhost:${PORT}/mcp`);
+// Bind to loopback only: this server has no auth of its own and trusts that
+// nothing but TrueForge (running on the same machine) can reach it. Do NOT
+// widen this to "0.0.0.0" without adding real authentication first --
+// anything else on the network would be able to call these action tools
+// directly and skip the human approval gate entirely.
+const HOST = "127.0.0.1";
+app.listen(PORT, HOST, () => {
+  console.log(`[actions-mcp-server] listening on http://${HOST}:${PORT}/mcp (loopback only)`);
   console.log("Tools: send_email, create_support_ticket, book_meeting");
   console.log("Register this URL in TrueForge -> Settings -> Connectors.");
 });

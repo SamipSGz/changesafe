@@ -10,7 +10,7 @@
  * API call when you're ready to point this at production systems. Keep the
  * approval gate either way.
  */
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,18 +22,33 @@ function dataFile(name: string): string {
   return join(DATA_DIR, name);
 }
 
+/** A missing file just means "no history yet" (fine). A file that exists
+ * but fails to parse means something got corrupted or truncated -- treating
+ * that the same as "empty" would let the very next write silently erase
+ * whatever history survived, so it throws instead. */
 function readJson<T>(name: string, fallback: T): T {
   const file = dataFile(name);
   if (!existsSync(file)) return fallback;
+  const raw = readFileSync(file, "utf-8");
+  if (raw.trim() === "") return fallback;
   try {
-    return JSON.parse(readFileSync(file, "utf-8")) as T;
-  } catch {
-    return fallback;
+    return JSON.parse(raw) as T;
+  } catch (err) {
+    throw new Error(
+      `Refusing to continue: ${file} exists but is not valid JSON (${(err as Error).message}). ` +
+        "Fix or remove it by hand before writing again -- overwriting it automatically would " +
+        "silently discard whatever history it still holds.",
+    );
   }
 }
 
+/** Write via a temp file + rename so a crash mid-write can never leave a
+ * half-written (and therefore unparsable-per-readJson) file behind. */
 function writeJson<T>(name: string, value: T): void {
-  writeFileSync(dataFile(name), JSON.stringify(value, null, 2), "utf-8");
+  const file = dataFile(name);
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmp, JSON.stringify(value, null, 2), "utf-8");
+  renameSync(tmp, file);
 }
 
 export interface AuditEntry {

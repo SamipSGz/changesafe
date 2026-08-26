@@ -53,7 +53,7 @@ of bolting it on:
 
 ## Setup
 
-Prerequisites: Node.js 20+, and your own API key for a model provider
+Prerequisites: Node.js 22+ (required by `@truefoundry/trueforge-sdk`), and your own API key for a model provider
 (OpenAI, Anthropic, Gemini, or any OpenAI-compatible endpoint).
 
 ```bash
@@ -153,10 +153,23 @@ and the approval gate around it keeps working unchanged.
 Every substantive change in this repo lands via a pull request reviewed by
 [Qodo](https://www.qodo.ai) before merge — no direct pushes to `main`.
 
-- Representative reviewed PR: _link added once Qodo is connected and the
-  first PR is reviewed — see [issue/PR tracker] for status._
-- High-severity findings, if any, are fixed or documented here with a
-  dismissal reason.
+- Representative reviewed PR:
+  [#1 — Scaffold approval-gated action assistant on TrueForge](https://github.com/SamipSGz/license-to-act/pull/1)
+  ([Qodo's review comment](https://github.com/SamipSGz/license-to-act/pull/1#issuecomment-5420363280))
+- Findings and how they were handled:
+
+  | # | Finding | Severity | Resolution |
+  |---|---------|----------|------------|
+  | 1 | `actions-mcp-server.ts` bound to the wildcard interface, letting any network-reachable client bypass the TrueForge approval gate | Action required | **Fixed** — server now binds to `127.0.0.1` explicitly, with a comment explaining why it must stay that way |
+  | 2 | README/CI advertised Node 20+, but `@truefoundry/trueforge-sdk` requires Node ≥22 | Action required | **Fixed** — README, `package.json` `engines`, and CI workflow all updated to Node 22 |
+  | 3 | `book_meeting`'s `startTime` was documented as ISO-8601 but accepted any string | Review recommended | **Fixed** — added a Zod `refine` that rejects unparsable datetimes |
+  | 4 | A corrupt/truncated JSON data file was silently treated as empty, so the next write would erase prior history | Review recommended | **Fixed** — reads now throw on a corrupt (vs. missing) file instead of discarding it, and writes go through a temp-file-plus-rename to avoid leaving a half-written file behind |
+  | 5 | Each tool saved the action, then wrote the audit entry — an audit-write failure could leave an executed action with no audit record | Review recommended | **Fixed** — audit entries are now written *before* the corresponding save, so an audit failure aborts the action instead of an action succeeding invisibly. (Full transactional idempotency across retries is out of scope for this mocked, file-backed demo store — noted here rather than silently ignored.) |
+
+All 5 findings were fixed, not dismissed; each fix was re-verified against a
+running instance of the MCP server (loopback binding, rejected/accepted
+`startTime` values, and the corrupt-file guard were all exercised by hand)
+before this table was written.
 
 ## License
 
