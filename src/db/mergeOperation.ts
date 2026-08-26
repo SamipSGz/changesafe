@@ -42,7 +42,17 @@ export interface MergeUndoSnapshot {
   reassignedTickets: { id: number; originalCustomerId: number }[];
 }
 
-function validateParams(db: Database.Database, params: MergeParams): void {
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+/** Fetches and validates every customer involved, INCLUDING that every
+ * removeId is actually a duplicate of keepId (same normalized email) --
+ * not just that the ids exist. Without this check, the tool's advertised
+ * "merge duplicate customers" scope would really be "delete any customer
+ * and reassign its data to any other customer," which is a much bigger
+ * and more dangerous surface than what's reviewed in preview_change. */
+function validateParams(db: Database.Database, params: MergeParams): CustomerRow[] {
   if (params.removeIds.length === 0) {
     throw new Error("removeIds must contain at least one customer id");
   }
@@ -51,30 +61,37 @@ function validateParams(db: Database.Database, params: MergeParams): void {
   }
   const ids = [params.keepId, ...params.removeIds];
   const placeholders = ids.map(() => "?").join(",");
-  const found = db
-    .prepare(`SELECT id FROM customers WHERE id IN (${placeholders})`)
-    .all(...ids) as { id: number }[];
-  const foundIds = new Set(found.map((r) => r.id));
-  const missing = ids.filter((id) => !foundIds.has(id));
+  const rows = db
+    .prepare(`SELECT id, name, email, created_at FROM customers WHERE id IN (${placeholders})`)
+    .all(...ids) as CustomerRow[];
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const missing = ids.filter((id) => !byId.has(id));
   if (missing.length > 0) {
     throw new Error(`No such customer id(s): ${missing.join(", ")}`);
   }
+
+  const keepEmail = normalizeEmail(byId.get(params.keepId)!.email);
+  const notDuplicates = params.removeIds
+    .map((id) => byId.get(id)!)
+    .filter((c) => normalizeEmail(c.email) !== keepEmail);
+  if (notDuplicates.length > 0) {
+    throw new Error(
+      `Refusing to merge: customer(s) ${notDuplicates.map((c) => c.id).join(", ")} do not share ` +
+        `keep customer ${params.keepId}'s email (${keepEmail}) -- they are not duplicates of it.`,
+    );
+  }
+
+  return rows;
 }
 
 /** Pure read-only computation -- issues only SELECT statements. Safe to
  * call as many times as you like; never mutates anything. */
 export function computeMergeManifest(db: Database.Database, params: MergeParams): MergeManifest {
-  validateParams(db, params);
-
-  const keepCustomer = db
-    .prepare("SELECT id, name, email, created_at FROM customers WHERE id = ?")
-    .get(params.keepId) as CustomerRow;
+  const rows = validateParams(db, params);
+  const keepCustomer = rows.find((r) => r.id === params.keepId)!;
+  const removeCustomers = rows.filter((r) => r.id !== params.keepId);
 
   const placeholders = params.removeIds.map(() => "?").join(",");
-  const removeCustomers = db
-    .prepare(`SELECT id, name, email, created_at FROM customers WHERE id IN (${placeholders})`)
-    .all(...params.removeIds) as CustomerRow[];
-
   const orderStats = db
     .prepare(
       `SELECT COUNT(*) as total, SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active
@@ -111,12 +128,9 @@ export function computeMergeManifest(db: Database.Database, params: MergeParams)
  * snapshot BEFORE mutating anything, so rollback_change can exactly
  * reverse this call later. */
 export function applyMerge(db: Database.Database, params: MergeParams): MergeUndoSnapshot {
-  validateParams(db, params);
+  const rows = validateParams(db, params);
+  const removedCustomers = rows.filter((r) => r.id !== params.keepId);
   const placeholders = params.removeIds.map(() => "?").join(",");
-
-  const removedCustomers = db
-    .prepare(`SELECT id, name, email, created_at FROM customers WHERE id IN (${placeholders})`)
-    .all(...params.removeIds) as CustomerRow[];
 
   const affectedOrders = db
     .prepare(`SELECT id, customer_id FROM orders WHERE customer_id IN (${placeholders})`)
@@ -143,8 +157,45 @@ export function applyMerge(db: Database.Database, params: MergeParams): MergeUnd
   };
 }
 
+/** Refuses to roll back if a LATER change has already touched the same
+ * rows -- e.g. two overlapping merges committed in sequence, then rolled
+ * back out of order. Without this check, undoMerge would blindly restore
+ * ownership from a stale snapshot and silently corrupt whatever the later
+ * change did. Call this before undoMerge, inside the same transaction. */
+export function assertUndoIsSafe(db: Database.Database, snapshot: MergeUndoSnapshot, keepId: number): void {
+  for (const o of snapshot.reassignedOrders) {
+    const row = db.prepare("SELECT customer_id FROM orders WHERE id = ?").get(o.id) as
+      | { customer_id: number }
+      | undefined;
+    if (!row || row.customer_id !== keepId) {
+      throw new Error(
+        `Cannot roll back: order ${o.id} was moved again by a later change and is no longer owned ` +
+          `by customer ${keepId}. Roll back that later change first.`,
+      );
+    }
+  }
+  for (const t of snapshot.reassignedTickets) {
+    const row = db.prepare("SELECT customer_id FROM support_tickets WHERE id = ?").get(t.id) as
+      | { customer_id: number }
+      | undefined;
+    if (!row || row.customer_id !== keepId) {
+      throw new Error(
+        `Cannot roll back: ticket ${t.id} was moved again by a later change and is no longer owned ` +
+          `by customer ${keepId}. Roll back that later change first.`,
+      );
+    }
+  }
+  for (const c of snapshot.removedCustomers) {
+    const exists = db.prepare("SELECT id FROM customers WHERE id = ?").get(c.id);
+    if (exists) {
+      throw new Error(`Cannot roll back: customer ${c.id} already exists again (conflict).`);
+    }
+  }
+}
+
 /** Reverses applyMerge exactly, using the undo snapshot captured at commit
- * time. Must also run inside a transaction the caller controls. */
+ * time. Must also run inside a transaction the caller controls, AFTER
+ * assertUndoIsSafe has passed. */
 export function undoMerge(db: Database.Database, snapshot: MergeUndoSnapshot): void {
   for (const c of snapshot.removedCustomers) {
     db.prepare("INSERT INTO customers (id, name, email, created_at) VALUES (?, ?, ?, ?)").run(

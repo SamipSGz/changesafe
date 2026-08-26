@@ -10,14 +10,37 @@
  * That asymmetry is what lets the demo show a real deny -> narrower
  * replan -> approve sequence driven by actual data, not a script.
  *
- * Usage: npm run db:seed  (safe to re-run -- deletes and recreates the file)
+ * Resets rows IN PLACE (DELETE + re-INSERT inside a transaction) rather
+ * than deleting and recreating the database file. If this unlinked the
+ * file while a `npm run tools:dev` process still had it open, that process
+ * would keep writing to the now-detached old file (on Unix) or the unlink
+ * could fail outright (on platforms that lock open files) -- either way
+ * the two processes would silently disagree about what the data is.
+ * Resetting in place avoids that regardless of what else has the file open.
+ *
+ * Usage: npm run db:seed. Best run between demo takes, not while a
+ * commit_change/rollback_change call is actually in flight elsewhere.
  */
-import { existsSync, unlinkSync } from "node:fs";
-import { DB_PATH, closeAll, writeDb } from "./client.js";
-
-if (existsSync(DB_PATH)) unlinkSync(DB_PATH);
+import { DB_PATH, writeDb, closeAll } from "./client.js";
 
 const db = writeDb();
+
+function tableExists(name: string): boolean {
+  return !!db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+}
+
+const resetTables = db.transaction(() => {
+  db.exec("DELETE FROM change_log");
+  db.exec("DELETE FROM support_tickets");
+  db.exec("DELETE FROM orders");
+  db.exec("DELETE FROM customers");
+  // sqlite_sequence only exists once something has been inserted into an
+  // AUTOINCREMENT table at least once -- guard for a truly fresh database.
+  if (tableExists("sqlite_sequence")) {
+    db.exec("DELETE FROM sqlite_sequence WHERE name IN ('orders', 'support_tickets')");
+  }
+});
+resetTables();
 
 const insertCustomer = db.prepare(
   "INSERT INTO customers (id, name, email, created_at) VALUES (?, ?, ?, ?)",

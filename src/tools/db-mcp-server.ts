@@ -35,26 +35,39 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { readonlyDb, writeDb } from "../db/client.js";
 import { getChange, insertPreview, markCommitted, markRolledBack } from "../db/changeLog.js";
-import { applyMerge, computeMergeManifest, undoMerge, type MergeUndoSnapshot } from "../db/mergeOperation.js";
+import {
+  applyMerge,
+  assertUndoIsSafe,
+  computeMergeManifest,
+  undoMerge,
+  type MergeUndoSnapshot,
+} from "../db/mergeOperation.js";
 
 const PORT = Number(process.env.DB_MCP_PORT ?? 8791);
 const MAX_QUERY_ROWS = 200;
 
 // A cheap but real second line of defense on top of the readonly SQLite
-// connection: refuse anything that isn't visibly a single SELECT before it
-// ever reaches the database at all.
+// connection: refuse anything that isn't visibly a single SELECT (or a
+// read-only CTE) before it ever reaches the database at all. This is
+// belt-and-suspenders, not the actual security boundary -- the readonly
+// connection in db/client.ts is what SQLite itself will refuse to write
+// through, regardless of what this heuristic catches or misses.
 const WRITE_KEYWORDS =
   /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX)\b/i;
 
 function assertReadOnlySql(sql: string): void {
   const trimmed = sql.trim().replace(/;+\s*$/, "");
-  if (!/^select\b/i.test(trimmed)) {
-    throw new Error("Only a single SELECT statement is allowed.");
+  if (!/^(select|with)\b/i.test(trimmed)) {
+    throw new Error("Only a single SELECT statement (optionally starting with WITH) is allowed.");
   }
-  if (trimmed.includes(";")) {
+  // Strip single-quoted string literals (SQL escapes an embedded quote as
+  // '') before scanning for write keywords, so a value like
+  // WHERE subject = 'DELETE my account' doesn't trip the guard.
+  const withoutStringLiterals = trimmed.replace(/'(?:[^']|'')*'/g, "''");
+  if (withoutStringLiterals.includes(";")) {
     throw new Error("Only a single statement is allowed (no semicolon-separated batches).");
   }
-  if (WRITE_KEYWORDS.test(trimmed)) {
+  if (WRITE_KEYWORDS.test(withoutStringLiterals)) {
     throw new Error("That looks like a write statement; query_readonly only runs SELECTs.");
   }
 }
@@ -101,9 +114,19 @@ function buildServer(): McpServer {
     },
     async ({ sql }) => {
       assertReadOnlySql(sql);
-      const rows = readonlyDb().prepare(sql).all();
-      const truncated = rows.length > MAX_QUERY_ROWS;
-      const result = { rowCount: rows.length, truncated, rows: rows.slice(0, MAX_QUERY_ROWS) };
+      // Iterate instead of .all() + slice: a huge result or an accidental
+      // cross join stops after MAX_QUERY_ROWS + 1 rows instead of fully
+      // materializing into memory first and only truncating afterward.
+      const rows: unknown[] = [];
+      let truncated = false;
+      for (const row of readonlyDb().prepare(sql).iterate()) {
+        if (rows.length >= MAX_QUERY_ROWS) {
+          truncated = true;
+          break;
+        }
+        rows.push(row);
+      }
+      const result = { rowCount: rows.length, truncated, rows };
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     },
   );
@@ -160,8 +183,22 @@ function buildServer(): McpServer {
         throw new Error(`change ${change_id} is already "${row.status}", not "previewed" -- refusing to re-run it.`);
       }
       const params = JSON.parse(row.params) as { keepId: number; removeIds: number[] };
+      const approvedManifest = JSON.parse(row.manifest);
 
       const commitTxn = db.transaction(() => {
+        // Recompute the manifest from CURRENT data, inside this same
+        // transaction, and refuse to proceed unless it's identical to what
+        // was previewed and approved. Without this, an overlapping change
+        // committed between preview and commit could make this commit
+        // affect a different set of rows than the human actually reviewed.
+        const currentManifest = computeMergeManifest(db, params);
+        if (JSON.stringify(currentManifest) !== JSON.stringify(approvedManifest)) {
+          throw new Error(
+            `Refusing to commit: the database has changed since this was previewed ` +
+              `(likely another change affected the same customer(s)). The approved plan is stale -- ` +
+              `call preview_change again and get a fresh approval.`,
+          );
+        }
         const undoSnapshot = applyMerge(db, params);
         markCommitted(db, change_id, undoSnapshot);
         return undoSnapshot;
@@ -202,8 +239,13 @@ function buildServer(): McpServer {
       }
       const snapshot = JSON.parse(row.undo_snapshot ?? "null") as MergeUndoSnapshot | null;
       if (!snapshot) throw new Error(`change ${change_id} has no undo snapshot recorded.`);
+      const { keepId } = JSON.parse(row.params) as { keepId: number; removeIds: number[] };
 
       const rollbackTxn = db.transaction(() => {
+        // Refuse if a later change already moved these same rows again --
+        // see assertUndoIsSafe's doc comment for why blindly restoring
+        // from a stale snapshot would corrupt that later change.
+        assertUndoIsSafe(db, snapshot, keepId);
         undoMerge(db, snapshot);
         markRolledBack(db, change_id);
       });

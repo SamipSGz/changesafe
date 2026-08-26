@@ -71,6 +71,44 @@ async function getOrCreateSession(): Promise<{ id: string; resumed: boolean }> {
   return { id: session.id, resumed: false };
 }
 
+/** The most recently created turn in a session. listTurns doesn't document
+ * a sort order, so this walks every page (a demo session has very few
+ * turns) and compares createdAt rather than assuming the first page is
+ * newest-first. */
+async function findLatestTurn(sessionId: string): Promise<TrueForgeApi.Turn | undefined> {
+  const page = await client.sessions.listTurns(sessionId, { limit: 25 });
+  let latest: TrueForgeApi.Turn | undefined;
+  for await (const turn of page) {
+    if (!latest || turn.createdAt > latest.createdAt) latest = turn;
+  }
+  return latest;
+}
+
+/** If the resumed session's last turn is sitting paused on an approval
+ * (e.g. the process was killed right after a tool.approval_required
+ * event), rebuild the event index from that turn's history and return the
+ * still-pending approvals so main() can go straight back into the
+ * approval loop instead of asking for a new message. Returns an empty
+ * array if there's nothing to resume. */
+async function recoverPendingApprovals(
+  sessionId: string,
+  events: Map<string, TrueForgeApi.TurnStreamingEvent>,
+): Promise<TrueForgeApi.ToolApprovalRequiredEvent[]> {
+  const latestTurn = await findLatestTurn(sessionId);
+  if (!latestTurn || latestTurn.state.status !== "done" || latestTurn.state.requiredActions.length === 0) {
+    return [];
+  }
+
+  const eventsPage = await client.sessions.listTurnEvents(sessionId, latestTurn.id, { limit: 100 });
+  for await (const event of eventsPage) {
+    events.set(event.id, event);
+  }
+
+  return latestTurn.state.requiredActions.filter(
+    (a): a is TrueForgeApi.ToolApprovalRequiredEvent => a.type === "tool.approval_required",
+  );
+}
+
 /** Stream one turn's events, print model text as it arrives, and return any
  * pending approval requests plus the running event index (needed to look up
  * each pending call's name/arguments). */
@@ -142,29 +180,36 @@ async function collectApprovals(
 
 async function main() {
   const { id: sessionId, resumed } = await getOrCreateSession();
-  console.log(
-    resumed
-      ? `Resumed session ${sessionId} -- picking up where you left off.`
-      : `Started session ${sessionId}.`,
-  );
+  const events = new Map<string, TrueForgeApi.TurnStreamingEvent>();
+  let pending: TrueForgeApi.ToolApprovalRequiredEvent[] = [];
+
+  if (resumed) {
+    pending = await recoverPendingApprovals(sessionId, events);
+    console.log(
+      pending.length > 0
+        ? `Resumed session ${sessionId} -- it was paused waiting for an approval. Resuming that now.`
+        : `Resumed session ${sessionId} -- picking up where you left off.`,
+    );
+  } else {
+    console.log(`Started session ${sessionId}.`);
+  }
   console.log('Try: "Find any duplicate customers and tell me what merging them would affect."');
   console.log('Type "exit" to quit (the session stays resumable next run).\n');
 
-  const events = new Map<string, TrueForgeApi.TurnStreamingEvent>();
-
   while (true) {
-    const userText = await rl.question("> ");
-    if (userText.trim().toLowerCase() === "exit") break;
-
-    let pending = await streamTurn(sessionId, [{ type: "user.message", content: userText }], events);
-
-    // An agent turn can pause for approval more than once in a row
-    // (e.g. two tool calls back to back) -- keep resolving until the
-    // turn actually finishes.
-    while (pending.length > 0) {
+    // Drain any pending approvals first -- whether they came from the turn
+    // we just streamed (a turn can pause more than once in a row, e.g. two
+    // tool calls back to back) or from recovering a paused turn on
+    // restart. Only prompt for new input once nothing is pending.
+    if (pending.length > 0) {
       const approvals = await collectApprovals(pending, events);
       pending = await streamTurn(sessionId, approvals, events);
+      continue;
     }
+
+    const userText = await rl.question("> ");
+    if (userText.trim().toLowerCase() === "exit") break;
+    pending = await streamTurn(sessionId, [{ type: "user.message", content: userText }], events);
   }
 
   rl.close();

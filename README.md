@@ -190,7 +190,9 @@ mid-conversation and run `npm run cli` again — it resumes the same
 session instead of starting over.
 
 To reset the demo data back to its original state at any point:
-`npm run db:seed`.
+`npm run db:seed` (resets rows in place; safe to run between demo takes,
+just not concurrently with an in-flight `commit_change`/`rollback_change`
+call elsewhere).
 
 ## Project layout
 
@@ -249,7 +251,26 @@ Every substantive change in this repo lands via a pull request reviewed by
   [#1 — Scaffold approval-gated action assistant on TrueForge](https://github.com/SamipSGz/changesafe/pull/1),
   merged after 5 findings (2 "Action required") were all fixed — see the
   fix table preserved in that PR's description and review thread.
-- **PR #2** (ChangeSafe rewrite): _link added once opened and reviewed._
+- **PR #2** (ChangeSafe rewrite):
+  [#2 — Pivot to ChangeSafe: an AI database operator on TrueForge](https://github.com/SamipSGz/changesafe/pull/2)
+  ([Qodo's review comment](https://github.com/SamipSGz/changesafe/pull/2#issuecomment-5421086444)),
+  8 findings (3 "Action required"), all fixed:
+
+  | # | Finding | Severity | Resolution |
+  |---|---------|----------|------------|
+  | 1 | `commit_change` trusted the stored preview manifest without recomputing it, so an overlapping approved change could make a commit affect more rows than what was actually reviewed | Action required | **Fixed** — `commit_change` now recomputes the manifest from current data inside the same transaction and refuses to proceed if it differs from what was approved |
+  | 2 | `rollback_change` restored ownership from a stale snapshot with no check for later changes, corrupting state if overlapping merges were rolled back out of order | Action required | **Fixed** — added `assertUndoIsSafe`, which refuses a rollback if a later change already moved the same rows again |
+  | 3 | The merge tool only checked that customer ids existed, not that they were actually duplicates — any two customers could be merged | Action required / Security | **Fixed** — `validateParams` now requires every removed customer's normalized email to match the kept customer's |
+  | 4 | `npm run db:seed` deleted and recreated the database file, which could split state from a running MCP server's already-open connection | Action required | **Fixed** — reseeding now resets rows in place (DELETE + re-INSERT in a transaction) instead of touching the file; verified live against a running server |
+  | 5 | Session persistence saved only the session id — restarting mid-approval-pause didn't actually recover the pending approval, contradicting what the README claimed | Action required | **Fixed** — on resume, the CLI now finds the latest turn, and if it's paused on an approval, rebuilds the event index and pending approvals before accepting new input |
+  | 6 | `query_readonly` called `.all()` before slicing to 200 rows, so a huge result or cross join fully materialized in memory first | Review recommended | **Fixed** — switched to `.iterate()` and stops after 200 rows; verified a 10-billion-row theoretical cross join returns in ~30ms |
+  | 7 | The read-only guard rejected valid `WITH ...` CTE queries because it only accepted a leading `SELECT` | Review recommended | **Fixed** — guard now accepts `WITH` or `SELECT`; the real enforcement (the physically read-only SQLite connection) was never affected |
+  | 8 | The write-keyword guard scanned raw SQL text, so a literal like `WHERE subject = 'DELETE my account'` was falsely rejected | Review recommended | **Fixed** — string literals are stripped before the keyword scan |
+
+  All 8 fixes were verified against a running instance of the MCP server
+  (not just read), including deliberately constructing the exact
+  overlapping-merge scenarios findings #1 and #2 describe and confirming
+  both the failure is now blocked and the correct order still succeeds.
 
 ## License
 
